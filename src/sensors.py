@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 
 import re
-import csv
 import time
 import pytz
 import psutil
 import socket
 import platform
+import subprocess
 import datetime as dt
-from subprocess import check_output
+import sys
 
+# Only needed if using alternate method of obtaining CPU temperature (see commented out code for approach)
+#from os import walk
+
+
+rpi_power_disabled = True
 try:
     from rpi_bad_power import new_under_voltage
-    rpi_power_disabled = False
+    if new_under_voltage() is not None:
+        # Only enable if import works and function returns a value
+        rpi_power_disabled = False
 except ImportError:
-    rpi_power_disabled = True
+    pass
 
 try:
     import apt
@@ -39,10 +46,9 @@ def static_vars(**kwargs):
 # Get OS information
 OS_DATA = {}
 with open('/etc/os-release') as f:
-    reader = csv.reader(f, delimiter='=')
-    for row in reader:
-        if row:
-            OS_DATA[row[0]] = row[1]
+    for line in f.readlines():
+        row = line.strip().split("=")
+        OS_DATA[row[0]] = row[1].strip('"')
 
 old_net_data = psutil.net_io_counters()
 previous_time = time.time() - 10
@@ -52,7 +58,16 @@ DEFAULT_TIME_ZONE = None
 if not rpi_power_disabled:
     _underVoltage = new_under_voltage()
 
+def set_default_timezone(timezone):
+    global DEFAULT_TIME_ZONE
+    DEFAULT_TIME_ZONE = timezone
+
+def write_message_to_console(message):
+    print(message)
+    sys.stdout.flush()
+
 def as_local(dattim: dt.datetime) -> dt.datetime:
+    global DEFAULT_TIME_ZONE
     """Convert a UTC datetime object to local time zone."""
     if dattim.tzinfo == DEFAULT_TIME_ZONE:
         return dattim
@@ -77,7 +92,7 @@ def get_updates():
     #this is a time consuming function, check only once every hour
     now = dt.datetime.now()
 
-    print(f"Update check: lastime: {get_updates.last_update_check}, now: {now}")
+    #print(f"Update check: lastime: {get_updates.last_update_check}, now: {now}")
     if (now - get_updates.last_update_check) > dt.timedelta(hours=1):
         print(f"Update check: More than one hour passed since last check. Checking available updates....")
         get_updates.last_update_check = now
@@ -92,33 +107,49 @@ def get_updates():
 
 # Temperature method depending on system distro
 def get_temp():
-    temp = '';
-    if 'rasp' in OS_DATA['ID']:
-        reading = check_output(['vcgencmd', 'measure_temp']).decode('UTF-8')
-        temp = str(re.findall('\d+.\d+', reading)[0])
-    else:
-        reading = check_output(['cat', '/sys/class/thermal/thermal_zone0/temp']).decode('UTF-8')
-        temp = str(reading[0] + reading[1] + '.' + reading[2]) # why?? need linux system to test
-    return temp
+    temp = 'Unknown'
+    # Utilising psutil for temp reading on ARM arch
+    try:
+        temp = psutil.sensors_temperatures()['cpu_thermal'][0].current
+    except:
+        try:
+            # Assumes that first entry is the CPU package, have not tested this on other systems except my NUC x86
+            temp = psutil.sensors_temperatures()['coretemp'][0].current
+        except Exception as e:
+            print('Could not establish CPU temperature reading: ' + str(e))
+            raise
+    return round(temp, 1)
 
-# Clock speed method depending on system distro
+            # Option to use thermal_zone readings instead of psutil
+
+            # base_dir = '/sys/class/thermal/'
+            # zone_dir = ''
+            # print('Could not cpu_thermal property. Checking thermal zone for x86 architecture')
+            # for root, dir, files in walk(base_dir):
+            #     for d in dir:
+            #         if 'thermal_zone' in d:
+            #             temp_type = str(subprocess.check_output(['cat', base_dir + d + '/type']).decode('UTF-8'))
+            #             if 'x86' in temp_type:
+            #                 zone_dir = d
+            #                 break
+            # temp = str(int(subprocess.check_output(['cat', base_dir + zone_dir + '/temp']).decode('UTF-8')) / 1000)
+
+
+# Replaced with psutil method - does this not work fine?
 def get_clock_speed():
-    clock_speed = '';
-    if 'rasp' in OS_DATA['ID']:
-        reading = check_output(['vcgencmd', 'measure_clock','arm']).decode('UTF-8')
-        clock_speed = str(int(re.findall('\d+', reading)[1]) / 1000000)
-    else: # need linux system to test
-        reading = check_output(['cat', '/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq']).decode('UTF-8')
-        clock_speed = str(int(re.findall('\d+', reading)[0]) / 1000)
+    clock_speed = int(psutil.cpu_freq().current)
     return clock_speed
 
 def get_disk_usage(path):
-    return str(psutil.disk_usage(path).percent)
-
+    try:
+        disk_percentage = str(psutil.disk_usage(path).percent)
+        return disk_percentage
+    except Exception as e:
+        print('Error while trying to obtain disk usage from ' + str(path) + ' with exception: ' + str(e))
+        return None # Changed to return None for handling exception at function call location
 
 def get_memory_usage():
     return str(psutil.virtual_memory().percent)
-
 
 def get_load(arg):
     return str(psutil.getloadavg()[arg])
@@ -143,8 +174,8 @@ def get_cpu_usage():
 def get_swap_usage():
     return str(psutil.swap_memory().percent)
 
-def get_wifi_strength():  # check_output(['/proc/net/wireless', 'grep wlan0'])
-    wifi_strength_value = check_output(
+def get_wifi_strength():  # subprocess.check_output(['/proc/net/wireless', 'grep wlan0'])
+    wifi_strength_value = subprocess.check_output(
                               [
                                   'bash',
                                   '-c',
@@ -156,13 +187,16 @@ def get_wifi_strength():  # check_output(['/proc/net/wireless', 'grep wlan0'])
     return (wifi_strength_value)
 
 def get_wifi_ssid():
-    ssid = check_output(
-                              [
-                                  'bash',
-                                  '-c',
-                                  '/usr/sbin/iwgetid -r',
-                              ]
-                          ).decode('utf-8').rstrip()
+    try:
+        ssid = subprocess.check_output(
+                                  [
+                                      'bash',
+                                      '-c',
+                                      '/usr/sbin/iwgetid -r',
+                                  ]
+                              ).decode('utf-8').rstrip()
+    except subprocess.CalledProcessError:
+        ssid = 'UNKNOWN'
     if not ssid:
         ssid = 'UNKNOWN'
     return (ssid)
@@ -198,21 +232,48 @@ def get_host_arch():
     except:
         return 'Unknown'
 
-def get_hdd_temp(path):
-    print(f"hdd temp path: '{path}'")
+# Builds an external drive entry to fix incorrect usage reporting
+def external_drive_base(drive, drive_path) -> dict:
+    return {
+        'name': f'Disk Use {drive}',
+        'unit': '%',
+        'icon': 'harddisk',
+        'sensor_type': 'sensor',
+        'function': lambda: get_disk_usage(f'{drive_path}')
+        }
+
+def smartctl_disk_temp_config(disk, disk_path) -> dict:
+    return {
+        'name': f'disk temperature {disk}',
+        'class': 'temperature',
+        'unit': '°C',
+        'icon': 'thermometer',
+        'sensor_type': 'sensor',
+        'function': lambda: get_disk_temp(f'{disk_path}')
+        }
+
+def smartctl_disk_tbw_config(disk, disk_path) -> dict:
+    return {
+        'name': f'TBW {disk}',
+        'unit': 'GiB',
+        'icon': 'harddisk',
+        'sensor_type': 'sensor',
+        'function': lambda: get_disk_tbw(f'{disk_path}')
+    }
+
+def get_disk_temp(path):
     sd = pySMART.Device(path)
     if sd.attributes[190] is not None:
         return str(sd.attributes[190].raw)
     elif sd.attributes[194] is not None:
         return str(sd.attributes[194].raw)
-    return "not available"
+    return None
 
-def get_hdd_tbw(path):
-    print(f"hdd tbw path: '{path}'")
+def get_disk_tbw(path):
     sd = pySMART.Device(path)
     if sd.attributes[241] is not None:
         return str(round(int(sd.attributes[241].raw) * 512 / 1024 /1024 / 1024))
-    return "not available"
+    return None
 
 sensors = {
           'temperature': 
