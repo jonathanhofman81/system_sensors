@@ -7,12 +7,12 @@ import signal
 import argparse
 import threading
 import paho.mqtt.client as mqtt
+import traceback
 
 from sensors import * 
 
 
 mqttClient = None
-poll_interval = 60
 deviceName = None
 settings = {}
 
@@ -27,18 +27,21 @@ class Job(threading.Thread):
         threading.Thread.__init__(self)
         self.daemon = False
         self.stopped = threading.Event()
-        self.interval = interval
+        self.interval = float(interval.total_seconds())
         self.execute = execute
         self.args = args
         self.kwargs = kwargs
+        print(f"wait interval: {self.interval} seconds")
 
     def stop(self):
         self.stopped.set()
         self.join()
 
     def run(self):
-        while not self.stopped.wait(self.interval.total_seconds()):
+        while True:
             self.execute(*self.args, **self.kwargs)
+            if self.stopped.wait(self.interval):
+                break
 
 def write_message_to_console(message):
     print(message)
@@ -47,9 +50,13 @@ def write_message_to_console(message):
 def update_sensors():
     payload_str = f'{{'
     for sensor, attr in sensors.items():
-        if settings['sensors'][sensor] == False:
+        if settings['sensors'].get(sensor, True) == False:
             continue
-        payload_str += f'"{sensor}": "{attr["function"]()}",'
+        try:
+            payload_str += f'"{sensor}": "{attr["function"]()}",'
+        except:
+            traceback.print_exc()
+            continue
     payload_str = payload_str[:-1]
     payload_str += f'}}'
     print(f'system-sensors/sensor/{deviceName}/state')
@@ -63,6 +70,7 @@ def update_sensors():
 
 def remove_old_topics():
     for sensor, attr in sensors.items():
+        print("sensor: ", sensor, attr)
         print(f'homeassistant/{attr["sensor_type"]}/{deviceName}/{sensor}/config')
         mqttClient.publish(
             topic=f'homeassistant/{attr["sensor_type"]}/{deviceName}/{sensor}/config',
@@ -76,7 +84,7 @@ def send_config_message(mqttClient):
     write_message_to_console('send config message')     
 
     for sensor, attr in sensors.items():
-        if settings['sensors'][sensor] == False:
+        if settings['sensors'].get(sensor, True) == False:
             continue
         mqttClient.publish(
             topic=f'homeassistant/sensor/{deviceName}/{sensor}/config',
@@ -89,7 +97,7 @@ def send_config_message(mqttClient):
                     + f'"unique_id":"{deviceName}_sensor_{sensor}",'
                     + f'"availability_topic":"system-sensors/sensor/{deviceName}/availability",'
                     + f'"device":{{"identifiers":["{deviceName}_sensor"],'
-                    + f'"name":"{deviceNameDisplay} Sensors","model":"RPI {deviceNameDisplay}", "manufacturer":"RPI"}}'
+                    + f'"name":"{deviceNameDisplay} Sensors","model":"{deviceNameDisplay}", "manufacturer":"SystemSensors"}}'
                     + (f',"icon":"mdi:{attr["icon"]}"' if 'icon' in attr else '')
                     + f'}}'
                     ),
@@ -107,7 +115,8 @@ def _parser():
 
 def set_defaults(settings):
     DEFAULT_TIME_ZONE = pytz.timezone(settings['timezone'])
-    poll_interval = settings['update_interval'] if 'update_interval' in settings else 60
+    if 'update_interval' not in settings:
+        settings['update_interval'] = 60
     if 'port' not in settings['mqtt']:
         settings['mqtt']['port'] = 1883
     if 'sensors' not in settings:
@@ -136,6 +145,9 @@ def check_settings(settings):
     if 'updates' in settings['sensors'] and apt_disabled:
         write_message_to_console('Unable to import apt package. Available updates will not be shown.')
         settings['sensors']['updates'] = False
+    if 'smartctl' in settings['sensors'] and smartctl_disabled:
+        write_message_to_console('Unable to import smartctl package. SMART monitoring will be disabled.')
+        settings['sensors']['smartctl'] = False
     if 'power_integer_state' in settings:
         write_message_to_console('power_integer_state is deprecated please remove this option power state is now a binary_sensor!')
 
@@ -145,8 +157,28 @@ def add_drives():
         sensors[f'disk_use_{drive.lower()}'] = {
                      'name': f'Disk Use {drive}',
                      'unit': '%',
-                     'icon': 'harddisk'
+                     'icon': 'harddisk',
+                     'sensor_type': 'sensor',
+                     'function': lambda path=settings['sensors']['external_drives'][drive]: get_disk_usage(path)
                      }
+
+def add_smartctl():
+    for hdd in settings['sensors']['smartctl']:
+        sensors[f'hdd_temp_{hdd.lower()}'] = {
+                 'name': f'disk temperature {hdd}',
+                 'class': 'temperature',
+                 'unit': '°C',
+                 'icon': 'thermometer',
+                 'sensor_type': 'sensor',
+                 'function': lambda devicepath=settings['sensors']['smartctl'][hdd]: get_hdd_temp(devicepath),
+                 }
+        sensors[f'TBW_{hdd.lower()}'] = {
+                 'name': f'TBW {hdd}',
+                 'unit': 'GiB',
+                 'icon': 'harddisk',
+                 'sensor_type': 'sensor',
+                 'function': lambda devicepath=settings['sensors']['smartctl'][hdd]: get_hdd_tbw(devicepath),
+                 }
 
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
@@ -172,6 +204,7 @@ if __name__ == '__main__':
     check_settings(settings)
     
     add_drives()
+    add_smartctl()
 
     deviceName = settings['deviceName'].replace(' ', '').lower()
     deviceNameDisplay = settings['deviceName']
@@ -197,9 +230,10 @@ if __name__ == '__main__':
     try:
         remove_old_topics() # why are we doing this??
         send_config_message(mqttClient)
-    except:
+    except Exception as e:
         write_message_to_console('something whent wrong') # say what went wrong
-    job = Job(interval=dt.timedelta(seconds=poll_interval), execute=update_sensors)
+        raise e
+    job = Job(interval=dt.timedelta(seconds=settings['update_interval']), execute=update_sensors)
     job.start()
 
     mqttClient.loop_start()

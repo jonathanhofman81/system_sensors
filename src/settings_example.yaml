@@ -5,11 +5,10 @@ mqtt:
   password: test
 deviceName: test
 client_id: test
-timezone: Europe/Brussels
+timezone: Europe/Amsterdam
 update_interval: 60 #Defaults to 60
 sensors:
-  wifi_strength: true
-  wifi_ssid: false
   available_updates: true
   external_drives:
     Drive1: /boot/
+

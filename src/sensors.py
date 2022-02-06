@@ -23,6 +23,19 @@ except ImportError:
     apt_disabled = True
 
 
+try:
+    import pySMART
+    smartctl_disabled = False
+except ImportError:
+    smartctl_disabled = True
+
+def static_vars(**kwargs):
+    def decorate(func):
+        for k in kwargs:
+            setattr(func, k, kwargs[k])
+        return func
+    return decorate
+
 # Get OS information
 OS_DATA = {}
 with open('/etc/os-release') as f:
@@ -58,11 +71,24 @@ def get_last_boot():
 def get_last_message():
     return str(as_local(utc_from_timestamp(time.time())).isoformat())
 
+
+@static_vars(last_update_check=dt.datetime.min, available_updates=0)
 def get_updates():
-    cache = apt.Cache()
-    cache.open(None)
-    cache.upgrade()
-    return str(cache.get_changes().__len__())
+    #this is a time consuming function, check only once every hour
+    now = dt.datetime.now()
+
+    print(f"Update check: lastime: {get_updates.last_update_check}, now: {now}")
+    if (now - get_updates.last_update_check) > dt.timedelta(hours=1):
+        print(f"Update check: More than one hour passed since last check. Checking available updates....")
+        get_updates.last_update_check = now
+
+        # check amound of updates
+        cache = apt.Cache()
+        cache.open(None)
+        cache.upgrade()
+        get_updates.available_updates = cache.get_changes().__len__()
+
+    return str(get_updates.available_updates)
 
 # Temperature method depending on system distro
 def get_temp():
@@ -83,7 +109,7 @@ def get_clock_speed():
         clock_speed = str(int(re.findall('\d+', reading)[1]) / 1000000)
     else: # need linux system to test
         reading = check_output(['cat', '/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq']).decode('UTF-8')
-        clock_speed = str(int(findall('\d+', reading)[0]) / 1000)
+        clock_speed = str(int(re.findall('\d+', reading)[0]) / 1000)
     return clock_speed
 
 def get_disk_usage(path):
@@ -172,6 +198,22 @@ def get_host_arch():
     except:
         return 'Unknown'
 
+def get_hdd_temp(path):
+    print(f"hdd temp path: '{path}'")
+    sd = pySMART.Device(path)
+    if sd.attributes[190] is not None:
+        return str(sd.attributes[190].raw)
+    elif sd.attributes[194] is not None:
+        return str(sd.attributes[194].raw)
+    return "not available"
+
+def get_hdd_tbw(path):
+    print(f"hdd tbw path: '{path}'")
+    sd = pySMART.Device(path)
+    if sd.attributes[241] is not None:
+        return str(round(int(sd.attributes[241].raw) * 512 / 1024 /1024 / 1024))
+    return "not available"
+
 sensors = {
           'temperature': 
                 {'name':'Temperature',
@@ -205,16 +247,19 @@ sensors = {
                  'function': get_cpu_usage},
           'load_1m':
                 {'name': 'Load 1m',
+                 'unit': u"\u200B", # dummy unit (zero whitespace) to display graph
                  'icon': 'cpu-64-bit',
                  'sensor_type': 'sensor',
                  'function': lambda: get_load(0)},
           'load_5m':
                 {'name': 'Load 5m',
+                 'unit': u"\u200B", # dummy unit (zero whitespace) to display graph
                  'icon': 'cpu-64-bit',
                  'sensor_type': 'sensor',
                  'function': lambda: get_load(1)},
           'load_15m':
                 {'name': 'Load 15m',
+                 'unit': u"\u200B", # dummy unit (zero whitespace) to display graph
                  'icon': 'cpu-64-bit',
                  'sensor_type': 'sensor',
                  'function': lambda: get_load(2)},
@@ -291,4 +336,4 @@ sensors = {
                  'icon': 'wifi',
                  'sensor_type': 'sensor',
                  'function': get_wifi_ssid},
-          }
+}
