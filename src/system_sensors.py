@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
+from os import error, path
 import sys
 import time
 import yaml
 import signal
+import pathlib
 import argparse
 import threading
 import paho.mqtt.client as mqtt
@@ -13,8 +15,11 @@ from sensors import *
 
 
 mqttClient = None
-deviceName = None
+global poll_interval
+devicename = None
 settings = {}
+external_drives = []
+smartctl_disks = []
 
 class ProgramKilled(Exception):
     pass
@@ -43,26 +48,22 @@ class Job(threading.Thread):
             if self.stopped.wait(self.interval):
                 break
 
-def write_message_to_console(message):
-    print(message)
-    sys.stdout.flush()
+
 
 def update_sensors():
     payload_str = f'{{'
     for sensor, attr in sensors.items():
-        if settings['sensors'].get(sensor, True) == False:
-            continue
-        try:
-            payload_str += f'"{sensor}": "{attr["function"]()}",'
-        except:
-            traceback.print_exc()
-            continue
+        # Skip sensors that have been disabled or are missing
+        if sensor in external_drives or sensor in smartctl_disks or (settings['sensors'][sensor] is not None and settings['sensors'][sensor] == True):
+            try:
+                payload_str += f'"{sensor}": "{attr["function"]()}",'
+            except:
+                traceback.print_exc()
+                continue
     payload_str = payload_str[:-1]
     payload_str += f'}}'
-    print(f'system-sensors/sensor/{deviceName}/state')
-    print(payload_str)
     mqttClient.publish(
-        topic=f'system-sensors/sensor/{deviceName}/state',
+        topic=f'system-sensors/{attr["sensor_type"]}/{devicename}/state',
         payload=payload_str,
         qos=1,
         retain=False,
@@ -81,42 +82,48 @@ def remove_old_topics():
 
 def send_config_message(mqttClient):
 
-    write_message_to_console('send config message')     
+    write_message_to_console('Sending config message to host...')     
 
     for sensor, attr in sensors.items():
-        if settings['sensors'].get(sensor, True) == False:
-            continue
-        mqttClient.publish(
-            topic=f'homeassistant/sensor/{deviceName}/{sensor}/config',
-            payload = (f'{{'
-                    + (f'"device_class":"{attr["class"]}",' if 'class' in attr else '')
-                    + f'"name":"{deviceNameDisplay} {attr["name"]}",'
-                    + f'"state_topic":"system-sensors/sensor/{deviceName}/state",'
-                    + (f'"unit_of_measurement":"{attr["unit"]}",' if 'unit' in attr else '')
-                    + f'"value_template":"{{{{value_json.{sensor}}}}}",'
-                    + f'"unique_id":"{deviceName}_sensor_{sensor}",'
-                    + f'"availability_topic":"system-sensors/sensor/{deviceName}/availability",'
-                    + f'"device":{{"identifiers":["{deviceName}_sensor"],'
-                    + f'"name":"{deviceNameDisplay} Sensors","model":"{deviceNameDisplay}", "manufacturer":"SystemSensors"}}'
-                    + (f',"icon":"mdi:{attr["icon"]}"' if 'icon' in attr else '')
-                    + f'}}'
-                    ),
-            qos=1,
-            retain=True,
-        )
+        try:
+            # Added check in case sensor is an external drive, which is nested in the config
+            if sensor in external_drives or sensor in smartctl_disks or settings['sensors'][sensor]:
+                mqttClient.publish(
+                    topic=f'homeassistant/{attr["sensor_type"]}/{devicename}/{sensor}/config',
+                    payload = (f'{{'
+                            + (f'"device_class":"{attr["class"]}",' if 'class' in attr else '')
+                            + f'"name":"{deviceNameDisplay} {attr["name"]}",'
+                            + f'"state_topic":"system-sensors/sensor/{devicename}/state",'
+                            + (f'"unit_of_measurement":"{attr["unit"]}",' if 'unit' in attr else '')
+                            + f'"value_template":"{{{{value_json.{sensor}}}}}",'
+                            + f'"unique_id":"{devicename}_sensor_{sensor}",'
+                            + f'"availability_topic":"system-sensors/sensor/{devicename}/availability",'
+                            + f'"device":{{"identifiers":["{devicename}_sensor"],'
+                            + f'"name":"{deviceNameDisplay} Sensors","model":"SystemSensors {deviceNameDisplay}", "manufacturer":"SystemSensors"}}'
+                            + (f',"icon":"mdi:{attr["icon"]}"' if 'icon' in attr else '')
+                            + f'}}'
+                            ),
+                    qos=1,
+                    retain=True,
+                )
+        except Exception as e:
+            write_message_to_console('An error was produced while processing ' + str(sensor) + ' with exception: ' + str(e))
+            print(str(settings))
+            traceback.print_exc()
+            raise
 
-    mqttClient.publish(f'system-sensors/sensor/{deviceName}/availability', 'online', retain=True)
+    mqttClient.publish(f'system-sensors/sensor/{devicename}/availability', 'online', retain=True)
 
 def _parser():
     """Generate argument parser"""
     parser = argparse.ArgumentParser()
-    parser.add_argument('settings', help='path to the settings file')
+    parser.add_argument('settings', help='path to the settings file')   
     return parser
 
 def set_defaults(settings):
-    DEFAULT_TIME_ZONE = pytz.timezone(settings['timezone'])
-    if 'update_interval' not in settings:
-        settings['update_interval'] = 60
+    global poll_interval
+    set_default_timezone(pytz.timezone(settings['timezone']))
+    poll_interval = settings['update_interval'] if 'update_interval' in settings else 60
     if 'port' not in settings['mqtt']:
         settings['mqtt']['port'] = 1883
     if 'sensors' not in settings:
@@ -124,14 +131,19 @@ def set_defaults(settings):
     for sensor in sensors:
         if sensor not in settings['sensors']:
             settings['sensors'][sensor] = True
-    if 'external_drives' not in settings['sensors']:
+    if 'external_drives' not in settings['sensors'] or settings['sensors']['external_drives'] is None:
         settings['sensors']['external_drives'] = {}
+    if 'smartctl_disks' not in settings['sensors'] or settings['sensors']['smartctl_disks'] is None:
+        settings['sensors']['smartctl_disks'] = {}
+
+    # 'settings' argument is local, so needs to be returned to overwrite the one in the main function
+    return settings
 
 def check_settings(settings):
-    values_to_check = ['mqtt', 'timezone', 'deviceName', 'client_id']
+    values_to_check = ['mqtt', 'timezone', 'devicename', 'client_id']
     for value in values_to_check:
         if value not in settings:
-            write_message_to_console('{value} not defined in settings.yaml! Please check the documentation')
+            write_message_to_console(value + ' not defined in settings.yaml! Please check the documentation')
             sys.exit()
     if 'hostname' not in settings['mqtt']:
         write_message_to_console('hostname not defined in settings.yaml! Please check the documentation')
@@ -140,7 +152,7 @@ def check_settings(settings):
         write_message_to_console('password not defined in settings.yaml! Please check the documentation')
         sys.exit()
     if 'power_status' in settings['sensors'] and rpi_power_disabled:
-        write_message_to_console('Unable to import apt package. Available updates will not be shown.')
+        write_message_to_console('Unable to import rpi_bad_power library, or is incompatible on host architecture. Power supply info will not be shown.')
         settings['sensors']['power_status'] = False
     if 'updates' in settings['sensors'] and apt_disabled:
         write_message_to_console('Unable to import apt package. Available updates will not be shown.')
@@ -152,39 +164,38 @@ def check_settings(settings):
         write_message_to_console('power_integer_state is deprecated please remove this option power state is now a binary_sensor!')
 
 def add_drives():
-    for drive in settings['sensors']['external_drives']:
-        # check if drives exist?
-        sensors[f'disk_use_{drive.lower()}'] = {
-                     'name': f'Disk Use {drive}',
-                     'unit': '%',
-                     'icon': 'harddisk',
-                     'sensor_type': 'sensor',
-                     'function': lambda path=settings['sensors']['external_drives'][drive]: get_disk_usage(path)
-                     }
+    drives = settings['sensors']['external_drives']
+    if drives is not None:
+        for drive in drives:
+            drive_path = settings['sensors']['external_drives'][drive]
+            usage = get_disk_usage(drive_path)
+            if usage:
+                sensors[f'disk_use_{drive.lower()}'] = external_drive_base(drive, drives[drive])
+                # Add drive to list with formatted name, for when checking sensors against settings items
+                external_drives.append(f'disk_use_{drive.lower()}')
+            else:
+                # Skip drives not found. Could be worth sending "not mounted" as the value if users want to track mount status.
+                print(drive + ' is not mounted to host. Check config or host drive mount settings.')
 
-def add_smartctl():
-    for hdd in settings['sensors']['smartctl']:
-        sensors[f'hdd_temp_{hdd.lower()}'] = {
-                 'name': f'disk temperature {hdd}',
-                 'class': 'temperature',
-                 'unit': '°C',
-                 'icon': 'thermometer',
-                 'sensor_type': 'sensor',
-                 'function': lambda devicepath=settings['sensors']['smartctl'][hdd]: get_hdd_temp(devicepath),
-                 }
-        sensors[f'TBW_{hdd.lower()}'] = {
-                 'name': f'TBW {hdd}',
-                 'unit': 'GiB',
-                 'icon': 'harddisk',
-                 'sensor_type': 'sensor',
-                 'function': lambda devicepath=settings['sensors']['smartctl'][hdd]: get_hdd_tbw(devicepath),
-                 }
+def add_smartctl_disks():
+    disks = settings['sensors']['smartctl_disks']
+    if disks is not None:
+        for disk in disks:
+            disk_path = settings['sensors']['smartctl_disks'][disk]
+            drive_temperature = get_disk_temp(disk_path)
+            if drive_temperature:
+                sensors[f'disk_temp_{disk.lower()}'] = smartctl_disk_temp_config(disk, disk_path)
+                smartctl_disks.append(f'disk_temp_{disk.lower()}')
+            disk_tbw = get_disk_tbw(disk_path)
+            if disk_tbw:
+                sensors[f'disk_tbw_{disk.lower()}'] = smartctl_disk_tbw_config(disk, disk_path)
+                smartctl_disks.append(f'disk_tbw_{disk.lower()}')
 
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         write_message_to_console('Connected to broker')
         client.subscribe('hass/status')
-        mqttClient.publish(f'system-sensors/sensor/{deviceName}/availability', 'online', retain=True)
+        mqttClient.publish(f'system-sensors/sensor/{devicename}/availability', 'online', retain=True)
     elif rc == 5:
         write_message_to_console('Authentication failed.\n Exiting.')
         sys.exit()
@@ -196,23 +207,41 @@ def on_message(client, userdata, message):
     if(message.payload.decode() == 'online'):
         send_config_message(client)
 
+
 if __name__ == '__main__':
-    args = _parser().parse_args()
-    with open(args.settings) as f:
+    try:
+        args = _parser().parse_args()
+        settings_file = args.settings
+    except:
+        write_message_to_console('Attempting to find settings file in same folder as ' + str(__file__))
+        default_settings_path = str(pathlib.Path(__file__).parent.resolve()) + '/settings.yaml'
+        if path.isfile(default_settings_path):
+            write_message_to_console('Settings file found, attempting to continue...')
+            settings_file = default_settings_path
+        else:
+            write_message_to_console('Could not find settings.yaml. Please check the documentation')
+            exit()
+
+    with open(settings_file) as f:
         settings = yaml.safe_load(f)
-    set_defaults(settings)
+
+    # Make settings file keys all lowercase
+    settings = {k.lower(): v for k,v in settings.items()}
+    # Prep settings with defaults if keys missing
+    settings = set_defaults(settings)
+    # Check for settings that will prevent the script from communicating with MQTT broker or break the script
     check_settings(settings)
     
     add_drives()
-    add_smartctl()
+    add_smartctl_disks()
 
-    deviceName = settings['deviceName'].replace(' ', '').lower()
-    deviceNameDisplay = settings['deviceName']
+    devicename = settings['devicename'].replace(' ', '').lower()
+    deviceNameDisplay = settings['devicename']
 
     mqttClient = mqtt.Client(client_id=settings['client_id'])
     mqttClient.on_connect = on_connect                      #attach function to callback
     mqttClient.on_message = on_message
-    mqttClient.will_set(f'system-sensors/sensor/{deviceName}/availability', 'offline', retain=True)
+    mqttClient.will_set(f'system-sensors/sensor/{devicename}/availability', 'offline', retain=True)
     if 'user' in settings['mqtt']:
         mqttClient.username_pw_set(
             settings['mqtt']['user'], settings['mqtt']['password']
@@ -226,14 +255,27 @@ if __name__ == '__main__':
             mqttClient.connect(settings['mqtt']['hostname'], settings['mqtt']['port'])
             break
         except ConnectionRefusedError:
+            # sleep for 2 minutes if broker is unavailable and retry. 
+            # Make this value configurable?
+            # this feels like a dirty hack. Is there some other way to do this?
             time.sleep(120)
+        except OSError:
+            # sleep for 10 minutes if broker is not reachable, i.e. network is down 
+            # Make this value configurable?
+            # this feels like a dirty hack. Is there some other way to do this?
+            time.sleep(600)
     try:
-        remove_old_topics() # why are we doing this??
         send_config_message(mqttClient)
     except Exception as e:
-        write_message_to_console('something whent wrong') # say what went wrong
-        raise e
-    job = Job(interval=dt.timedelta(seconds=settings['update_interval']), execute=update_sensors)
+        write_message_to_console('Error while attempting to send config to MQTT host: ' + str(e))
+        exit()
+    try:    
+        update_sensors()
+    except Exception as e:
+        write_message_to_console('Error while attempting to perform inital sensor update: ' + str(e))
+        exit()
+
+    job = Job(interval=dt.timedelta(seconds=poll_interval), execute=update_sensors)
     job.start()
 
     mqttClient.loop_start()
@@ -244,7 +286,7 @@ if __name__ == '__main__':
             time.sleep(1)
         except ProgramKilled:
             write_message_to_console('Program killed: running cleanup code')
-            mqttClient.publish(f'system-sensors/sensor/{deviceName}/availability', 'offline', retain=True)
+            mqttClient.publish(f'system-sensors/sensor/{devicename}/availability', 'offline', retain=True)
             mqttClient.disconnect()
             mqttClient.loop_stop()
             sys.stdout.flush()
